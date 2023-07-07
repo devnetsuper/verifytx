@@ -1,54 +1,55 @@
-from openpyxl.styles import colors, PatternFill, Font, Color
-from requests.adapters import HTTPAdapter, Retry
-from openpyxl import load_workbook
+import asyncio
+import aiohttp
+from aiohttp.client import ClientSession
 import requests
 import shutil
 import os
+from openpyxl.styles import colors, PatternFill, Font, Color
+from openpyxl import load_workbook
 
-def run():
+
+# Same as before
+ASSET_TX_URL = {
+    'ADA': ['https://explorer.cardano.org/en/transaction?id='],
+    'ALGO': ['https://algoexplorer.io/tx/'],
+    'ATOM': ['https://atomscan.com/transactions/'],
+    'BCH': ['https://www.blockchain.com/bch/tx/'],
+    'BSV': ['https://bsv.tokenview.com/en/tx/'],
+    'BTT': ['https://bttcscan.com/tx/'],
+    'DASH': ['https://explorer.dash.org/insight/tx/'],
+    'DOGE': ['https://blockchair.com/dogecoin/transaction/'],
+    'DOT': ['https://polkascan.io/polkadot/transaction/'],
+    'EOS': ['https://eosflare.io/tx/'],
+    'GAS': ['https://neoscan.io/transaction/'],
+    'LTC': ['https://litecoinblockexplorer.net/tx/'],
+    'NANO': ['https://nanolooker.com/block/'],
+    'NEO': ['https://neoscan.io/transaction/'],
+    'SOL': ['https://explorer.solana.com/tx/'],
+    'TRX': ['https://tronscan.org/#/transaction/'],
+    'VET': ['https://explore.vechain.org/transactions/'],
+    'XLM': ['https://stellarchain.io/tx/'],
+    'XRP': ['https://xrpscan.com/tx/'],
+    'ZEC': ['https://zcash.tokenview.com/en/tx/'],
+    'BTC': ['https://mempool.space/tx/']
+}
+
+SCAN_TX_URL = ['https://etherscan.io/tx/', 'https://polygonscan.com/tx/',
+               'https://bscscan.com/tx/', 'https://snowtrace.io/tx/', 'https://ftmscan.com/tx/']
+
+# Limit the number of concurrent tasks
+SEMAPHORE = asyncio.Semaphore(100)
+
+
+async def execute():
     INPUT_PATH = 'input/'
     OUTPUT_PATH = 'output/'
 
-    ASSET_TX_URL = {
-        'ADA':['https://explorer.cardano.org/en/transaction?id='],
-        'ALGO':['https://algoexplorer.io/tx/'],
-        'ATOM':['https://atomscan.com/transactions/'],
-        'BCH':['https://www.blockchain.com/bch/tx/'],
-        'BSV':['https://bsv.tokenview.com/en/tx/'],
-        'BTT':['https://bttcscan.com/tx/'],
-        'DASH':['https://explorer.dash.org/insight/tx/'],
-        'DOGE':['https://dogechain.info/tx/'],
-        'DOT':['https://polkascan.io/polkadot/transaction/'],
-        'EOS':['https://eosflare.io/tx/'],
-        'GAS':['https://neoscan.io/transaction/'],
-        'LTC':['https://litecoinblockexplorer.net/tx/'],
-        'NANO':['https://nanolooker.com/block/'],
-        'NEO':['https://neoscan.io/transaction/'],
-        'SOL':['https://explorer.solana.com/tx/'],
-        'TRX':['https://tronscan.org/#/transaction/'],
-        'VET':['https://explore.vechain.org/transactions/'],
-        'XLM':['https://stellarchain.io/tx/'],
-        'XRP':['https://xrpscan.com/tx/'],
-        'ZEC':['https://zcash.tokenview.com/en/tx/'],
-        'BTC':['https://www.blockchain.com/btc/tx/']
-    }
-
-    SCAN_TX_URL = ['https://etherscan.io/tx/', 'https://polygonscan.com/tx/', 'https://bscscan.com/tx/', 'https://snowtrace.io/tx/', 'https://ftmscan.com/tx/']
-
-    def verify_tx_url(url):
-        HEADERS = {
-            "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/74.0.3729.169 Safari/537.36" ,
-            'referer':'https://www.google.com/'
-        }
-        response = requests.Session()
-        retries = Retry(total=15, backoff_factor=.1)
-        response.mount('https://', HTTPAdapter(max_retries=retries))
-        result = response.get(url, headers=HEADERS, timeout=2)
-        if result.status_code != 200 or 'unable to locate this TxnHash' in result.text:
-            return False
-            
+    async def verify_tx_url(url, session):
+        async with session.get(url) as result:
+            if result.status != 200:
+                return False
         return True
-    
+
     _, _, files = next(os.walk(INPUT_PATH))
 
     for file in files:
@@ -61,18 +62,38 @@ def run():
             asset_idx = None
             work_book.active = worksheet_idx
             work_sheet = work_book.active
-            print(f'Working with {file} - {work_sheet.title}')
-            
-            def invalidate(row, col):
+
+            async def invalidate(row, col):
                 work_sheet[row][col].value = 'Null'
-                work_sheet[row][col].fill = PatternFill(start_color='F2D3D7', end_color='F2D3D7', fill_type = 'solid')
-                work_sheet[row][col].font = Font(color='9C0039')            
-                
-            def validate(row, col, value):
+                work_sheet[row][col].fill = PatternFill(
+                    start_color='F2D3D7', end_color='F2D3D7', fill_type='solid')
+                work_sheet[row][col].font = Font(color='9C0039')
+
+            async def validate(row, col, value):
                 work_sheet[row][col].value = value
-                work_sheet[row][col].fill = PatternFill(start_color='C3ECCB', end_color='C3ECCB', fill_type = 'solid')
-                work_sheet[row][col].font = Font(color='006100')             
-           
+                work_sheet[row][col].fill = PatternFill(
+                    start_color='C3ECCB', end_color='C3ECCB', fill_type='solid')
+                work_sheet[row][col].font = Font(color='006100')
+
+            async def verify(session, prefixes, tx_id, row_idx, tx_url_idx):
+                for prefix in prefixes:
+                    tx_url = f'{prefix}{tx_id}'
+                    if prefix in SCAN_TX_URL and not tx_id.startswith('0x'):
+                        tx_url = f'{prefix}0x{tx_id}'
+
+                    try:
+                        # Add a timeout for each task
+                        if await asyncio.wait_for(verify_tx_url(tx_url, session), timeout=30):
+                            await validate(row_idx, tx_url_idx, f'=HYPERLINK("{tx_url}", "Verified")')
+                            break
+                        else:
+                            await invalidate(row_idx, tx_url_idx)
+                    except Exception as e:
+                        print(f'Error in verify for row {row_idx}: {e}')
+                        await invalidate(row_idx, tx_url_idx)
+
+
+
             for column_idx, column_name in enumerate(work_sheet[1]):
                 if column_name.value in ('Transaction Details', 'Transaction ID', 'Transaction Detail'):
                     tx_id_idx = column_idx
@@ -82,38 +103,49 @@ def run():
                     asset_idx = column_idx
 
             row_count = work_sheet.max_row
-           
+
+            conn = aiohttp.TCPConnector(limit=15)
+            session = aiohttp.ClientSession(connector=conn)
+            tasks = []
+
             for row_idx in range(2, row_count + 1):
-                print(f'Working with row #{row_idx}/{row_count}')
+                print(f'Processing {work_sheet.title} - row#{row_idx}/{row_count}')
                 if tx_id_idx is not None and tx_url_idx is not None:
                     tx_id = work_sheet[row_idx][tx_id_idx].value
-                    
+
                     if not tx_id:
-                        invalidate(row_idx, tx_url_idx)
+                        await invalidate(row_idx, tx_url_idx)
                         continue
-                        
+
                     prefixes = []
                     if asset_idx is not None:
                         asset = work_sheet[row_idx][asset_idx].value
                         if asset is None:
                             prefixes = SCAN_TX_URL
                         else:
-                            prefixes = ASSET_TX_URL.get(asset.upper(), SCAN_TX_URL)
-                            
-                    for prefix in prefixes:
-                        tx_url = f'{prefix}{tx_id}'
-                        if prefix in SCAN_TX_URL and not tx_id.startswith('0x'):
-                            tx_url = f'{prefix}0x{tx_id}'
-                            
-                        try:
-                            if verify_tx_url(tx_url):
-                                validate(row_idx, tx_url_idx, f'=HYPERLINK("{tx_url}", "Verified")')
-                                break
-                            else:
-                                invalidate(row_idx, tx_url_idx)
-                        except Exception as e:
-                            invalidate(row_idx, tx_url_idx)
-                    
+                            prefixes = ASSET_TX_URL.get(
+                                asset.upper(), SCAN_TX_URL)
+
+                    async with SEMAPHORE:
+                        task = asyncio.ensure_future(
+                            verify(session, prefixes, tx_id, row_idx, tx_url_idx))
+                        tasks.append(task)
+
+                # Periodically save the workbook
+                if row_idx % 100 == 0:
+                    work_book.save(f'{OUTPUT_PATH}{file}')
+
+            # Check for exceptions
+            results = await asyncio.gather(*tasks, return_exceptions=True)
+            for result in results:
+                if isinstance(result, Exception):
+                    print(f'Error in task: {result}')
+
+            await session.close()
+
         print('Verification Complete.')
         work_book.save(f'{OUTPUT_PATH}{file}')
-    
+
+
+def run():
+    asyncio.run(execute())
